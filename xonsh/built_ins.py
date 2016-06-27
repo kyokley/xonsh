@@ -9,7 +9,6 @@ import builtins
 from collections import Sequence
 from contextlib import contextmanager
 import inspect
-from glob import iglob
 import os
 import re
 import shlex
@@ -19,25 +18,27 @@ import sys
 import tempfile
 import time
 
+from xonsh.lazyasd import LazyObject
+from xonsh.history import History
+from xonsh.inspectors import Inspector
 from xonsh.aliases import Aliases, make_default_aliases
 from xonsh.environ import Env, default_env, locate_binary
 from xonsh.foreign_shells import load_foreign_aliases
-from xonsh.history import History
-from xonsh.inspectors import Inspector
 from xonsh.jobs import add_job, wait_for_active_job
 from xonsh.platform import ON_POSIX, ON_WINDOWS
 from xonsh.proc import (ProcProxy, SimpleProcProxy, ForegroundProcProxy,
                         SimpleForegroundProcProxy, TeePTYProc,
                         CompletedCommand, HiddenCompletedCommand)
 from xonsh.tools import (
-    suggest_commands, XonshError, expandvars, CommandsCache, globpath,
-    iglobpath
+    suggest_commands, expandvars, globpath, XonshError,
+    XonshCalledProcessError, XonshBlockError
 )
+from xonsh.commands_cache import CommandsCache
 
 
 ENV = None
 BUILTINS_LOADED = False
-INSPECTOR = Inspector()
+INSPECTOR = LazyObject(Inspector, globals(), 'INSPECTOR')
 AT_EXIT_SIGNALS = (signal.SIGABRT, signal.SIGFPE, signal.SIGILL, signal.SIGSEGV,
                    signal.SIGTERM)
 
@@ -130,12 +131,26 @@ def reglob(path, parts=None, i=None):
     return paths
 
 
-def regexpath(s, pymode=False):
-    """Takes a regular expression string and returns a list of file
-    paths that match the regex.
-    """
+def regexsearch(s):
     s = expand_path(s)
-    o = reglob(s)
+    return reglob(s)
+
+
+def globsearch(s):
+    csc = builtins.__xonsh_env__.get('CASE_SENSITIVE_COMPLETIONS')
+    return globpath(s, ignore_case=(not csc), return_empty=True)
+
+
+def pathsearch(func, s, pymode=False):
+    """
+    Takes a string and returns a list of file paths that match (regex, glob,
+    or arbitrary search function).
+    """
+    if (not callable(func) or
+            len(inspect.signature(func).parameters) != 1):
+        error = "%r is not a known path search function"
+        raise XonshError(error % searchfunc)
+    o = func(s)
     no_match = [] if pymode else [s]
     return o if len(o) != 0 else no_match
 
@@ -216,11 +231,6 @@ def get_script_subproc_command(fname, args):
         interp = o
 
     return interp + [fname] + args
-
-
-def _subproc_pre():
-    os.setpgrp()
-    signal.signal(signal.SIGTSTP, lambda n, f: signal.pause())
 
 
 _REDIR_NAME = "(o(?:ut)?|e(?:rr)?|a(?:ll)?|&?\d?)"
@@ -341,6 +351,7 @@ def run_subproc(cmds, captured=False):
     if cmds[-1] == '&':
         background = True
         cmds = cmds[:-1]
+    _pipeline_group = None
     write_target = None
     last_cmd = len(cmds) - 1
     procs = []
@@ -401,13 +412,23 @@ def run_subproc(cmds, captured=False):
         elif builtins.__xonsh_stderr_uncaptured__ is not None:
             stderr = builtins.__xonsh_stderr_uncaptured__
         uninew = (ix == last_cmd) and (not _capture_streams)
-        alias = builtins.aliases.get(cmd[0], None)
+        # find alias
+        if callable(cmd[0]):
+            alias = cmd[0]
+        else:
+            alias = builtins.aliases.get(cmd[0], None)
         procinfo['alias'] = alias
+        # find binary location, if not callable
+        if alias is None:
+            binary_loc = locate_binary(cmd[0])
+        elif not callable(alias):
+            binary_loc = locate_binary(alias[0])
+        # implement AUTO_CD
         if (alias is None and
                 builtins.__xonsh_env__.get('AUTO_CD') and
                 len(cmd) == 1 and
                 os.path.isdir(cmd[0]) and
-                locate_binary(cmd[0]) is None):
+                binary_loc is None):
             cmd.insert(0, 'cd')
             alias = builtins.aliases.get('cd', None)
 
@@ -415,13 +436,13 @@ def run_subproc(cmds, captured=False):
             aliased_cmd = alias
         else:
             if alias is not None:
-                cmd = alias + cmd[1:]
-            n = locate_binary(cmd[0])
-            if n is None:
-                aliased_cmd = cmd
+                aliased_cmd = alias + cmd[1:]
             else:
+                aliased_cmd = cmd
+            if binary_loc is not None:
                 try:
-                    aliased_cmd = get_script_subproc_command(n, cmd[1:])
+                    aliased_cmd = get_script_subproc_command(binary_loc,
+                                                             aliased_cmd[1:])
                 except PermissionError:
                     e = 'xonsh: subprocess mode: permission denied: {0}'
                     raise XonshError(e.format(cmd[0]))
@@ -429,8 +450,8 @@ def run_subproc(cmds, captured=False):
         if (stdin is not None and
                 ENV.get('XONSH_STORE_STDIN') and
                 captured == 'object' and
-                'cat' in __xonsh_commands_cache__ and
-                'tee' in __xonsh_commands_cache__):
+                __xonsh_commands_cache__.lazy_locate_binary('cat') and
+                __xonsh_commands_cache__.lazy_locate_binary('tee')):
             _stdin_file = tempfile.NamedTemporaryFile()
             cproc = Popen(['cat'],
                           stdin=stdin,
@@ -461,11 +482,22 @@ def run_subproc(cmds, captured=False):
             cls = TeePTYProc if usetee else Popen
             subproc_kwargs = {}
             if ON_POSIX and cls is Popen:
+                def _subproc_pre():
+                    if _pipeline_group is None:
+                        os.setpgrp()
+                    else:
+                        os.setpgid(0, _pipeline_group)
+                    signal.signal(signal.SIGTSTP, lambda n, f: signal.pause())
                 subproc_kwargs['preexec_fn'] = _subproc_pre
+            env = ENV.detype()
+            if ON_WINDOWS:
+                # Over write prompt variable as xonsh's $PROMPT does
+                # not make much sense for other subprocs
+                env['PROMPT'] = '$P$G'
             try:
                 proc = cls(aliased_cmd,
                            universal_newlines=uninew,
-                           env=ENV.detype(),
+                           env=env,
                            stdin=stdin,
                            stdout=stdout,
                            stderr=stderr,
@@ -482,11 +514,8 @@ def run_subproc(cmds, captured=False):
                 raise XonshError(e)
         procs.append(proc)
         prev_proc = proc
-    for proc in procs[:-1]:
-        try:
-            proc.stdout.close()
-        except OSError:
-            pass
+        if ON_POSIX and cls is Popen and _pipeline_group is None:
+            _pipeline_group = prev_proc.pid
     if not prev_is_proxy:
         add_job({
             'cmds': cmds,
@@ -507,6 +536,11 @@ def run_subproc(cmds, captured=False):
     if prev_is_proxy:
         prev_proc.wait()
     wait_for_active_job()
+    for proc in procs[:-1]:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
     hist = builtins.__xonsh_history__
     hist.last_cmd_rtn = prev_proc.returncode
     # get output
@@ -564,6 +598,7 @@ def run_subproc(cmds, captured=False):
     if captured == 'stdout':
         return output
     elif captured is not False:
+        procinfo['executed_cmd'] = aliased_cmd
         procinfo['pid'] = prev_proc.pid
         procinfo['returncode'] = prev_proc.returncode
         procinfo['timestamp'] = (starttime, time.time())
@@ -625,6 +660,17 @@ def ensure_list_of_strs(x):
     return rtn
 
 
+def list_of_strs_or_callables(x):
+    """Ensures that x is a list of strings or functions"""
+    if isinstance(x, str) or callable(x):
+        rtn = [x]
+    elif isinstance(x, Sequence):
+        rtn = [i if isinstance(i, str) or callable(i) else str(i) for i in x]
+    else:
+        rtn = [str(x)]
+    return rtn
+
+
 def load_builtins(execer=None, config=None, login=False, ctx=None):
     """Loads the xonsh builtins into the Python builtins. Sets the
     BUILTINS_LOADED variable to True.
@@ -635,7 +681,9 @@ def load_builtins(execer=None, config=None, login=False, ctx=None):
     builtins.__xonsh_env__ = ENV = Env(default_env(config=config, login=login))
     builtins.__xonsh_help__ = helper
     builtins.__xonsh_superhelp__ = superhelper
-    builtins.__xonsh_regexpath__ = regexpath
+    builtins.__xonsh_pathsearch__ = pathsearch
+    builtins.__xonsh_globsearch__ = globsearch
+    builtins.__xonsh_regexsearch__ = regexsearch
     builtins.__xonsh_glob__ = globpath
     builtins.__xonsh_expand_path__ = expand_path
     builtins.__xonsh_exit__ = False
@@ -656,11 +704,16 @@ def load_builtins(execer=None, config=None, login=False, ctx=None):
     builtins.__xonsh_commands_cache__ = CommandsCache()
     builtins.__xonsh_all_jobs__ = {}
     builtins.__xonsh_ensure_list_of_strs__ = ensure_list_of_strs
+    builtins.__xonsh_list_of_strs_or_callables__ = list_of_strs_or_callables
     # public built-ins
+    builtins.XonshError = XonshError
+    builtins.XonshBlockError = XonshBlockError
+    builtins.XonshCalledProcessError = XonshCalledProcessError
     builtins.evalx = None if execer is None else execer.eval
     builtins.execx = None if execer is None else execer.exec
     builtins.compilex = None if execer is None else execer.compile
 
+    # sneak the path search functions into the aliases
     # Need this inline/lazy import here since we use locate_binary that relies on __xonsh_env__ in default aliases
     builtins.default_aliases = builtins.aliases = Aliases(make_default_aliases())
     if login:
@@ -676,7 +729,8 @@ def load_builtins(execer=None, config=None, login=False, ctx=None):
 
 
 def _lastflush(s=None, f=None):
-    builtins.__xonsh_history__.flush(at_exit=True)
+    if hasattr(builtins, '__xonsh_history__'):
+        builtins.__xonsh_history__.flush(at_exit=True)
 
 
 def unload_builtins():
@@ -698,7 +752,9 @@ def unload_builtins():
              '__xonsh_ctx__',
              '__xonsh_help__',
              '__xonsh_superhelp__',
-             '__xonsh_regexpath__',
+             '__xonsh_pathsearch__',
+             '__xonsh_globsearch__',
+             '__xonsh_regexsearch__',
              '__xonsh_glob__',
              '__xonsh_expand_path__',
              '__xonsh_exit__',
@@ -713,12 +769,16 @@ def unload_builtins():
              '__xonsh_subproc_uncaptured__',
              '__xonsh_execer__',
              '__xonsh_commands_cache__',
+             'XonshError',
+             'XonshBlockError',
+             'XonshCalledProcessError',
              'evalx',
              'execx',
              'compilex',
              'default_aliases',
              '__xonsh_all_jobs__',
              '__xonsh_ensure_list_of_strs__',
+             '__xonsh_list_of_strs_or_callables__',
              '__xonsh_history__',
              ]
     for name in names:

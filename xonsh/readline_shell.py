@@ -3,10 +3,12 @@
 
 Portions of this code related to initializing the readline library
 are included from the IPython project.  The IPython project is:
-    * Copyright (c) 2008-2014, IPython Development Team
-    * Copyright (c) 2001-2007, Fernando Perez <fernando.perez@colorado.edu>
-    * Copyright (c) 2001, Janko Hauser <jhauser@zscout.de>
-    * Copyright (c) 2001, Nathaniel Gray <n8gray@caltech.edu>
+
+* Copyright (c) 2008-2014, IPython Development Team
+* Copyright (c) 2001-2007, Fernando Perez <fernando.perez@colorado.edu>
+* Copyright (c) 2001, Janko Hauser <jhauser@zscout.de>
+* Copyright (c) 2001, Nathaniel Gray <n8gray@caltech.edu>
+
 """
 import os
 import sys
@@ -18,17 +20,21 @@ from cmd import Cmd
 from threading import Thread
 from collections import deque
 
-from xonsh import lazyjson
+from xonsh.lazyjson import LazyJSON
+from xonsh.lazyasd import LazyObject
 from xonsh.base_shell import BaseShell
 from xonsh.ansi_colors import partial_color_format, color_style_names, color_style
 from xonsh.environ import partial_format_prompt, multiline_prompt
 from xonsh.tools import print_exception
 from xonsh.platform import HAS_PYGMENTS, ON_WINDOWS, ON_CYGWIN, ON_DARWIN
 
-if HAS_PYGMENTS:
-    from xonsh import pyghooks
-    import pygments
-    from pygments.formatters.terminal256 import Terminal256Formatter
+pygments = LazyObject(lambda: importlib.import_module('pygments'),
+                      globals(), 'pygments')
+terminal256 = LazyObject(lambda: importlib.import_module(
+                                    'pygments.formatters.terminal256'),
+                      globals(), 'terminal')
+pyghooks = LazyObject(lambda: importlib.import_module('xonsh.pyghooks'),
+                      globals(), 'pyghooks')
 
 readline = None
 RL_COMPLETION_SUPPRESS_APPEND = RL_LIB = RL_STATE = None
@@ -231,10 +237,13 @@ class ReadlineShell(BaseShell, Cmd):
         rl_completion_suppress_append()  # this needs to be called each time
         mline = line.partition(' ')[2]
         offs = len(mline) - len(text)
-        x = [(i[offs:] if " " in i[:-1] else i)
-             for i in self.completer.complete(text, line,
-                                              begidx, endidx,
-                                              ctx=self.ctx)[0]]
+        if self.completer is None:
+            x = []
+        else:
+            x = [(i[offs:] if " " in i[:-1] else i)
+                 for i in self.completer.complete(text, line,
+                                                  begidx, endidx,
+                                                  ctx=self.ctx)[0]]
         return x
 
     # tab complete on first index too
@@ -412,7 +421,7 @@ class ReadlineShell(BaseShell, Cmd):
             env = builtins.__xonsh_env__
             self.styler.style_name = env.get('XONSH_COLOR_STYLE')
             style_proxy = pyghooks.xonsh_style_proxy(self.styler)
-            formatter = Terminal256Formatter(style=style_proxy)
+            formatter = terminal256.Terminal256Formatter(style=style_proxy)
             s = pygments.format(string, formatter).rstrip()
         print(s, **kwargs)
 
@@ -449,7 +458,7 @@ class ReadlineHistoryAdder(Thread):
         i = 1
         for _, _, f in files:
             try:
-                lj = lazyjson.LazyJSON(f, reopen=False)
+                lj = LazyJSON(f, reopen=False)
                 for cmd in lj['cmds']:
                     inp = cmd['inp'].splitlines()
                     for line in inp:
@@ -460,5 +469,5 @@ class ReadlineHistoryAdder(Thread):
                             RL_LIB.history_set_pos(i)
                         i += 1
                 lj.close()
-            except (IOError, OSError):
+            except (IOError, OSError, ValueError):
                 continue

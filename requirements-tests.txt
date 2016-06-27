@@ -1,4 +1,6 @@
 ply
-nose
+pytest
 prompt-toolkit
 pygments
+coverage
+codecov

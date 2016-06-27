@@ -36,7 +36,6 @@ class PromptToolkitShell(BaseShell):
                 'enable_auto_suggest_bindings': True,
                 'enable_search': True,
                 'enable_abort_and_exit_bindings': True,
-                'enable_open_in_editor': True,
                 }
 
         self.key_bindings_manager = KeyBindingManager(**key_bindings_manager_args)
@@ -72,7 +71,6 @@ class PromptToolkitShell(BaseShell):
                     'get_rprompt_tokens': get_rprompt_tokens,
                     'style': PygmentsStyle(xonsh_style_proxy(self.styler)),
                     'completer': completer,
-                    'lexer': PygmentsLexer(XonshLexer),
                     'multiline': multiline,
                     'get_continuation_tokens': self.continuation_tokens,
                     'history': history,
@@ -81,6 +79,8 @@ class PromptToolkitShell(BaseShell):
                     'key_bindings_registry': self.key_bindings_manager.registry,
                     'display_completions_in_columns': multicolumn,
                     }
+            if builtins.__xonsh_env__.get('COLOR_INPUT'):
+                prompt_args['lexer'] = PygmentsLexer(XonshLexer)
             line = self.prompter.prompt(**prompt_args)
         return line
 
@@ -142,7 +142,10 @@ class PromptToolkitShell(BaseShell):
         prompt.
         """
         p = builtins.__xonsh_env__.get('RIGHT_PROMPT')
-        if len(p) == 0:
+        # partial_format_prompt does handle empty strings properly,
+        # but this avoids descending into it in the common case of
+        # $RIGHT_PROMPT == ''.
+        if isinstance(p, str) and len(p) == 0:
             return []
         try:
             p = partial_format_prompt(p)

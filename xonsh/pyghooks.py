@@ -4,28 +4,34 @@ import os
 import re
 import string
 import builtins
+import importlib
 from warnings import warn
 from collections import ChainMap
 from collections.abc import MutableMapping
 
+# must come before pygments imports
+from xonsh.bg_pkg_resources import load_pkg_resources_in_background
+load_pkg_resources_in_background()
+
 from pygments.lexer import inherit, bygroups, using, this
-from pygments.token import (Keyword, Name, Comment, String, Error, Number,
-                            Operator, Generic, Whitespace, Token)
 from pygments.lexers.shell import BashLexer
 from pygments.lexers.agile import PythonLexer
+from pygments.token import (Keyword, Name, Comment, String, Error, Number,
+                            Operator, Generic, Whitespace, Token)
 from pygments.style import Style
 from pygments.styles import get_style_by_name
 import pygments.util
 
+from xonsh.lazyasd import LazyObject
 from xonsh.tools import (ON_WINDOWS, intensify_colors_for_cmd_exe,
                          expand_gray_colors_for_cmd_exe)
+from xonsh.tokenize import SearchPath
+
 
 class XonshSubprocLexer(BashLexer):
     """Lexer for xonsh subproc mode."""
-
     name = 'Xonsh subprocess lexer'
-
-    tokens = {'root': [(r'`[^`]*?`', String.Backtick), inherit, ]}
+    tokens = {'root': [(SearchPath, String.Backtick), inherit, ]}
 
 
 ROOT_TOKENS = [(r'\?', Keyword),
@@ -89,7 +95,9 @@ XonshSubprocLexer.tokens['root'] = [
 
 Color = Token.Color  # alias to new color token namespace
 
-RE_BACKGROUND = re.compile('(BG#|BGHEX|BACKGROUND)')
+RE_BACKGROUND = LazyObject(lambda: re.compile('(BG#|BGHEX|BACKGROUND)'),
+                           globals(), 'RE_BACKGROUND')
+
 
 def norm_name(name):
     """Normalizes a color name."""
@@ -186,15 +194,26 @@ def code_by_name(name, styles):
 
 
 def partial_color_tokenize(template):
-    """Toeknizes a template string containing colors. Will return a list
+    """Tokenizes a template string containing colors. Will return a list
     of tuples mapping the token to the string which has that color.
     These sub-strings maybe templates themselves.
     """
-    formatter = string.Formatter()
     if hasattr(builtins, '__xonsh_shell__'):
         styles = __xonsh_shell__.shell.styler.styles
     else:
         styles = None
+    color = Color.NO_COLOR
+    try:
+        toks, color = _partial_color_tokenize_main(template, styles)
+    except:
+        toks = [(Color.NO_COLOR, template)]
+    if styles is not None:
+        styles[color]  # ensure color is available
+    return toks
+
+
+def _partial_color_tokenize_main(template, styles):
+    formatter = string.Formatter()
     bopen = '{'
     bclose = '}'
     colon = ':'
@@ -229,9 +248,7 @@ def partial_color_tokenize(template):
         else:
             value += literal
     toks.append((color, value))
-    if styles is not None:
-        styles[color]  # ensure color is available
-    return toks
+    return toks, color
 
 
 class CompoundColorMap(MutableMapping):
@@ -543,7 +560,7 @@ if hasattr(pygments.style, 'ansicolors'):
     }
 elif ON_WINDOWS and 'CONEMUANSI' not in os.environ:
     # These colors must match the color specification
-    # in prompt_toolkit, so the colors are converted 
+    # in prompt_toolkit, so the colors are converted
     # correctly when using cmd.exe
     DEFAULT_STYLE = {
         Color.BLACK: '#000000',

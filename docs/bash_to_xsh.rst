@@ -14,10 +14,13 @@ will help you put a finger on how to do the equivelent task in xonsh.
     * - ``$NAME`` or ``${NAME}``
       - ``$NAME``
       - Look up an environment variable by name.
+    * - ``echo "$HOME/hello"``
+      - ``echo "$HOME/hello"``
+      - Construct an argument using an environment variable.
     * - ``something/$SOME_VAR/$(some_command)``
       - ``@('something/' + $SOME_VAR + $(some_command).strip())``
       - Concatenate a variable or text with the result of running a command.
-    * - ``${${VAR}}``
+    * - ``${!VAR}``
       - ``${var or expr}``
       - Look up an environment variable via another variable name. In xonsh,
         this may be any valid expression.
@@ -40,5 +43,10 @@ will help you put a finger on how to do the equivelent task in xonsh.
       - ``or`` as well as ``||``
       - Logical-or operator for subprocesses.
     * - ``$?``
-      - ``__xonsh_history__.rtns[-1]``
+      - ``_.rtn``
       - Returns the exit code, or status, of the previous command.
+    * - ``N=V command``
+      - ``with ${...}.swap(N=V): command``
+      - Set temporary environment variable(s) and execute for command.
+        Use an indented block to execute many commands in the same context.
+
